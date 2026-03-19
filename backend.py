@@ -1,79 +1,111 @@
-# used for the camera
-import cv2
-import mediapipe as mp
+# ============================================================
+#  iLert — Drowsiness Detection Backend
+#  Uses OpenCV + MediaPipe Face Mesh to detect closed eyes
+#  and plays an alarm when the user appears to fall asleep.
+# ============================================================
+
+import os
 import time
-from playsound import playsound
-import pygame
+import cv2                       # OpenCV — camera capture & image processing
+import mediapipe as mp           # MediaPipe — pre-trained ML face-mesh model
+import pygame                    # Pygame — audio playback for the alarm
 
-# Variables for timing
-both_eyes_closed_start_time = None
-alert_threshold = 1  # Time in seconds to detect if they fell asleep.
+# ── Configuration ────────────────────────────────────────────
+ALERT_THRESHOLD = 1              # Seconds both eyes must stay closed before alarm
+LEFT_EYE_THRESHOLD  = 0.015      # Vertical-distance threshold for the left eye
+RIGHT_EYE_THRESHOLD = 0.004      # Vertical-distance threshold for the right eye
 
+# ── Audio Setup ──────────────────────────────────────────────
 pygame.mixer.init()
 
+# Build the alarm path relative to *this* script's location
+ALARM_PATH = os.path.join(os.path.dirname(__file__), "alarm.mp3")
+
+
 def play_alarm():
-    pygame.mixer.music.load("C:/Users/j_jaj/OneDrive/Desktop/iLert/alarm.mp3")
+    """Load and play the alarm sound file."""
+    pygame.mixer.music.load(ALARM_PATH)
     pygame.mixer.music.play()
-    
-# Initialize Camera and Mediapipe
-cam = cv2.VideoCapture(0)
+
+
+# ── MediaPipe Face Mesh Initialization ───────────────────────
+# refine_landmarks=True adds iris landmarks for better accuracy
 face_mesh = mp.solutions.face_mesh.FaceMesh(refine_landmarks=True)
 
+# ── Camera Initialization ────────────────────────────────────
+cam = cv2.VideoCapture(0)        # 0 = default webcam
+
+# Timer: tracks when both eyes first closed
+both_eyes_closed_start_time = None
+
+# ── Main Detection Loop ─────────────────────────────────────
 while True:
-    _, frame = cam.read()
-    frame = cv2.flip(frame, 1)  # Flip frame vertically because the camera is flipped
+    success, frame = cam.read()
+    if not success:
+        continue                 # Skip if the frame wasn't captured
+
+    # Mirror the frame so it feels like looking in a mirror
+    frame = cv2.flip(frame, 1)
+
+    # Get frame dimensions (needed to convert normalised → pixel coords)
     frame_h, frame_w, _ = frame.shape
+
+    # MediaPipe expects RGB; OpenCV captures in BGR
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    output = face_mesh.process(rgb_frame)
 
-    landmark_points = output.multi_face_landmarks
-    both_eyes_closed = False  # Reset eye state
+    # Run the face-mesh model on the current frame
+    results = face_mesh.process(rgb_frame)
 
-    if landmark_points:
-        landmarks = landmark_points[0].landmark
+    # ── Process Detections ───────────────────────────────────
+    if results.multi_face_landmarks:
+        landmarks = results.multi_face_landmarks[0].landmark
 
-        # Left eye landmarks
-        left_eye = [landmarks[145], landmarks[159]]
-        left_eye_ratio = left_eye[0].y - left_eye[1].y
+        # Left-eye vertical landmarks  (top: 159, bottom: 145)
+        left_top    = landmarks[159]
+        left_bottom = landmarks[145]
+        left_eye_ratio = left_bottom.y - left_top.y   # positive when open
 
-        # Right eye landmarks
-        right_eye = [landmarks[374], landmarks[386]]
-        right_eye_ratio = right_eye[0].y - right_eye[1].y
+        # Right-eye vertical landmarks (top: 386, bottom: 374)
+        right_top    = landmarks[386]
+        right_bottom = landmarks[374]
+        right_eye_ratio = right_bottom.y - right_top.y  # positive when open
 
-        # Draw landmarks for both eyes
-        for landmark in left_eye + right_eye:
-            x = int(landmark.x * frame_w)
-            y = int(landmark.y * frame_h)
-            cv2.circle(frame, (x, y), 3, (0, 255, 255))  # Yellow for eyes
+        # Draw small circles on the eye landmarks for visual feedback
+        for lm in [left_top, left_bottom, right_top, right_bottom]:
+            px = int(lm.x * frame_w)
+            py = int(lm.y * frame_h)
+            cv2.circle(frame, (px, py), 3, (0, 255, 255), -1)  # Yellow dots
 
-        # Check if both eyes are closed
-        left_eye_closed = left_eye_ratio < 0.015  # keep it 0.0015. Most accurate landmarks for left eye are not perfect.
-        right_eye_closed = right_eye_ratio < 0.004  
+        # ── Eye-Closure Check ────────────────────────────────
+        left_closed  = left_eye_ratio  < LEFT_EYE_THRESHOLD
+        right_closed = right_eye_ratio < RIGHT_EYE_THRESHOLD
+        both_closed  = left_closed and right_closed
 
-        if left_eye_closed and right_eye_closed:
-            both_eyes_closed = True
-
-        # Timing logic for detecting if user fell asleep
-        if both_eyes_closed:
+        # ── Timer Logic ──────────────────────────────────────
+        if both_closed:
             if both_eyes_closed_start_time is None:
-                both_eyes_closed_start_time = time.time()  # Start timer
-            elif time.time() - both_eyes_closed_start_time >= alert_threshold:
+                # Eyes just closed — start the timer
+                both_eyes_closed_start_time = time.time()
+            elif time.time() - both_eyes_closed_start_time >= ALERT_THRESHOLD:
+                # Eyes have been closed long enough — trigger alert!
                 print("ALERT: USER FELL ASLEEP!")
-                cv2.putText(frame, "WAKE UP!", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2.putText(frame, "WAKE UP!", (20, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
                 play_alarm()
-                both_eyes_closed_start_time = None  # Reset to avoid spamming alerts
+                both_eyes_closed_start_time = None  # Reset to avoid spamming
         else:
-            both_eyes_closed_start_time = None  # Reset if eyes are open
+            # Eyes are open — reset the timer
+            both_eyes_closed_start_time = None
 
-    # Display writing
-    
-    cv2.imshow('Sight Line', frame)
+    # ── Display the Camera Feed ──────────────────────────────
+    cv2.imshow("iLert — Drowsiness Monitor", frame)
 
-    # Exit loop on pressing 'q'
-    if cv2.waitKey(1) & 0xFF == ord('q'):
+    # Press 'q' to quit
+    if cv2.waitKey(1) & 0xFF == ord("q"):
         break
 
-    time.sleep(0.05)  # found the camera being very choppy so I added this to deal with the fps.
+    time.sleep(0.05)  # Small delay to smooth out frame rate
+
+# ── Cleanup ──────────────────────────────────────────────────
 cam.release()
 cv2.destroyAllWindows()
-
